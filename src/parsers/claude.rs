@@ -136,9 +136,34 @@ impl ClaudeCodeParser {
             request_id: data.request_id.map(String::from),
             source: Some("claude".into()),
             provider: None,
-            project: data.cwd.map(String::from),
+            project: data.cwd.map(|cwd| project_from_cwd(cwd).to_string()),
         })
     }
+}
+
+/// Map a session `cwd` to its project. Worktree sessions and `isolation:
+/// worktree` subagents run in `<repo>/.claude/worktrees/<name>`, which would
+/// otherwise split each worktree into its own project; fold them into `<repo>`.
+fn project_from_cwd(cwd: &str) -> &str {
+    let is_sep = |c: char| c == '/' || c == '\\';
+    let mut start = 0;
+    while let Some(rel) = cwd[start..].find(".claude") {
+        let at = start + rel;
+        start = at + ".claude".len();
+        // `.claude` must be a whole component with a repo path before it.
+        let Some(repo) = cwd[..at].strip_suffix(is_sep) else {
+            continue;
+        };
+        let mut rest = cwd[start..].splitn(4, is_sep);
+        if rest.next() == Some("")
+            && rest.next() == Some("worktrees")
+            && rest.next().is_some_and(|name| !name.is_empty())
+            && !repo.is_empty()
+        {
+            return repo;
+        }
+    }
+    cwd
 }
 
 impl Default for ClaudeCodeParser {
@@ -409,6 +434,67 @@ mod tests {
         let mut bytes = line.as_bytes().to_vec();
         let entry = parser.parse_line(&mut bytes).expect("entry parsed");
         assert_eq!(entry.project.as_deref(), Some("/work/demo"));
+    }
+
+    #[test]
+    fn test_parse_line_folds_worktree_cwd_into_repo_project() {
+        let parser = ClaudeCodeParser::with_data_dir(PathBuf::from("tests/fixtures"));
+        let line = r#"{"type":"assistant","timestamp":"2026-01-15T10:00:01.500Z","cwd":"G:\\work\\demo\\.claude\\worktrees\\agent-a1b2c3","message":{"model":"claude-sonnet-4","id":"msg-w","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let mut bytes = line.as_bytes().to_vec();
+        let entry = parser.parse_line(&mut bytes).expect("entry parsed");
+        assert_eq!(entry.project.as_deref(), Some(r"G:\work\demo"));
+    }
+
+    // Worktree sessions and `isolation: worktree` subagents run in
+    // `<repo>/.claude/worktrees/<name>`; their usage belongs to `<repo>`.
+    #[test]
+    fn test_project_from_cwd_folds_claude_worktrees() {
+        assert_eq!(
+            project_from_cwd(r"G:\work\demo\.claude\worktrees\agent-a1b2c3"),
+            r"G:\work\demo"
+        );
+        assert_eq!(
+            project_from_cwd("/work/demo/.claude/worktrees/file-library"),
+            "/work/demo"
+        );
+        assert_eq!(
+            project_from_cwd("/work/demo/.claude/worktrees/file-library/src/ui"),
+            "/work/demo"
+        );
+        assert_eq!(
+            project_from_cwd(r"G:\work\demo/.claude\worktrees/mixed"),
+            r"G:\work\demo"
+        );
+        assert_eq!(
+            project_from_cwd(r"\\server\share\demo\.claude\worktrees\x"),
+            r"\\server\share\demo"
+        );
+        assert_eq!(
+            project_from_cwd("/home/jöhn/프로젝트/.claude/worktrees/x"),
+            "/home/jöhn/프로젝트"
+        );
+        // An earlier non-worktree `.claude` component is skipped, not matched.
+        assert_eq!(
+            project_from_cwd("/work/.claude/skills/demo/.claude/worktrees/x"),
+            "/work/.claude/skills/demo"
+        );
+    }
+
+    #[test]
+    fn test_project_from_cwd_leaves_other_paths_unchanged() {
+        for cwd in [
+            "/work/demo",
+            r"G:\work\demo",
+            "/work/demo/.claude",
+            "/work/demo/.claude/worktrees",
+            "/work/demo/.claude/worktrees/",
+            "/work/demo/my.claude/worktrees/x",
+            "/work/demo/.claude/worktrees2/x",
+            "/work/demo/.claude/skills/x",
+            ".claude/worktrees/x",
+        ] {
+            assert_eq!(project_from_cwd(cwd), cwd, "{cwd}");
+        }
     }
 
     #[test]
