@@ -528,6 +528,8 @@ mod tests {
         /// Per-request breakdown of the same counters; drift inside it does not
         /// change what we bill, so it stays opaque.
         iterations: Option<serde_json::Value>,
+        /// Observed only as `null` so far; does not change token counts.
+        fallback_credit: Option<serde_json::Value>,
     }
 
     #[derive(Deserialize)]
