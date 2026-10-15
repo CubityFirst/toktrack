@@ -141,6 +141,48 @@ impl ClaudeCodeParser {
     }
 }
 
+/// Just the `cwd` of a transcript line, for finding a session's launch directory.
+#[derive(Deserialize)]
+struct CwdLine<'a> {
+    cwd: Option<&'a str>,
+}
+
+/// Lines scanned for a parent session's launch `cwd` before giving up; real
+/// transcripts record it within their first ten lines.
+const LAUNCH_CWD_SCAN_LIMIT: usize = 200;
+
+/// Project of a line's `cwd`, if it records one.
+fn line_project(line: &str) -> Option<String> {
+    if !line.contains("\"cwd\"") {
+        return None;
+    }
+    let mut bytes = line.as_bytes().to_vec();
+    let parsed: CwdLine = simd_json::from_slice(&mut bytes).ok()?;
+    parsed.cwd.map(|cwd| project_from_cwd(cwd).to_string())
+}
+
+/// Project of the first `cwd` in a transcript: the session's launch directory.
+fn launch_project(path: &Path) -> Option<String> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    reader
+        .lines()
+        .take(LAUNCH_CWD_SCAN_LIMIT)
+        .filter_map(std::result::Result::ok)
+        .find_map(|line| line_project(&line))
+}
+
+/// Main transcript of the session a subagent or workflow-agent transcript
+/// belongs to: `<project>/<sid>/subagents/...` -> `<project>/<sid>.jsonl`.
+fn parent_transcript(path: &Path) -> Option<PathBuf> {
+    let session_dir = path
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "subagents"))?
+        .parent()?;
+    let mut name = session_dir.file_name()?.to_os_string();
+    name.push(".jsonl");
+    Some(session_dir.with_file_name(name))
+}
+
 /// Map a session `cwd` to its project. Worktree sessions and `isolation:
 /// worktree` subagents run in `<repo>/.claude/worktrees/<name>`, which would
 /// otherwise split each worktree into its own project; fold them into `<repo>`.
@@ -190,6 +232,13 @@ impl CLIParser for ClaudeCodeParser {
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
 
+        // `cwd` follows every `cd`, and subagents start wherever the parent
+        // currently is, so per-line attribution scatters one session across a
+        // project per subdirectory. Attribute everything to the launch
+        // directory: the parent session's for subagent transcripts, else this
+        // transcript's own first `cwd`.
+        let mut launch = parent_transcript(path).and_then(|parent| launch_project(&parent));
+
         for line_result in reader.lines() {
             let line = match line_result {
                 Ok(l) => l,
@@ -200,8 +249,15 @@ impl CLIParser for ClaudeCodeParser {
                 continue;
             }
 
+            if launch.is_none() {
+                launch = line_project(&line);
+            }
+
             let mut line_bytes = line.into_bytes();
-            if let Some(entry) = self.parse_line(&mut line_bytes) {
+            if let Some(mut entry) = self.parse_line(&mut line_bytes) {
+                if launch.is_some() {
+                    entry.project.clone_from(&launch);
+                }
                 entries.push(entry);
             }
         }
@@ -495,6 +551,116 @@ mod tests {
         ] {
             assert_eq!(project_from_cwd(cwd), cwd, "{cwd}");
         }
+    }
+
+    fn usage_line(id: &str, cwd: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-01-15T10:00:01.500Z",
+            "cwd": cwd,
+            "requestId": format!("req-{id}"),
+            "message": {"model": "claude-sonnet-4", "id": format!("msg-{id}"),
+                        "usage": {"input_tokens": 10, "output_tokens": 5}}
+        })
+        .to_string()
+    }
+
+    fn write_lines(path: &Path, lines: &[String]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    }
+
+    fn projects_of(path: &Path) -> Vec<Option<String>> {
+        let parser = ClaudeCodeParser::with_data_dir(PathBuf::from("unused"));
+        let entries = parser.parse_file(path).unwrap();
+        entries.into_iter().map(|e| e.project).collect()
+    }
+
+    // `cwd` follows every `cd`, so per-line attribution splits one session
+    // across a row per subdirectory. The session's launch directory wins.
+    #[test]
+    fn test_main_session_uses_launch_cwd_for_every_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("proj").join("sess.jsonl");
+        write_lines(
+            &main,
+            &[
+                r#"{"type":"permission-mode","permissionMode":"default"}"#.to_string(),
+                usage_line("a", "/work/demo"),
+                usage_line("b", "/work/demo/sub"),
+                usage_line("c", "/work/demo/sub/deeper"),
+            ],
+        );
+
+        assert_eq!(projects_of(&main), vec![Some("/work/demo".into()); 3]);
+    }
+
+    // Subagents start in the parent's *current* cwd, not its launch dir.
+    #[test]
+    fn test_subagent_inherits_parent_session_launch_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let proj = temp.path().join("proj");
+        write_lines(
+            &proj.join("sess.jsonl"),
+            &[
+                r#"{"type":"mode","mode":"normal"}"#.to_string(),
+                r#"{"type":"user","cwd":"/work/demo","message":{"role":"user","content":"hi"}}"#
+                    .to_string(),
+                usage_line("p", "/work/demo/sub"),
+            ],
+        );
+        let agent = proj.join("sess").join("subagents").join("agent-x.jsonl");
+        write_lines(&agent, &[usage_line("s1", "/work/demo/sub")]);
+        let workflow_agent = proj
+            .join("sess")
+            .join("subagents")
+            .join("workflows")
+            .join("wf_1")
+            .join("agent-y.jsonl");
+        write_lines(&workflow_agent, &[usage_line("s2", "/work/demo/other")]);
+
+        assert_eq!(projects_of(&agent), vec![Some("/work/demo".into())]);
+        assert_eq!(
+            projects_of(&workflow_agent),
+            vec![Some("/work/demo".into())]
+        );
+    }
+
+    #[test]
+    fn test_subagent_without_parent_transcript_uses_own_first_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp
+            .path()
+            .join("proj")
+            .join("sess")
+            .join("subagents")
+            .join("agent-x.jsonl");
+        write_lines(
+            &agent,
+            &[
+                usage_line("a", "/work/demo/sub"),
+                usage_line("b", "/work/demo"),
+            ],
+        );
+
+        assert_eq!(projects_of(&agent), vec![Some("/work/demo/sub".into()); 2]);
+    }
+
+    #[test]
+    fn test_subagent_of_worktree_session_folds_to_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let proj = temp.path().join("proj");
+        write_lines(
+            &proj.join("sess.jsonl"),
+            &[usage_line("p", "/work/demo/.claude/worktrees/feature")],
+        );
+        let agent = proj.join("sess").join("subagents").join("agent-x.jsonl");
+        write_lines(
+            &agent,
+            &[usage_line("s", "/work/demo/.claude/worktrees/feature/src")],
+        );
+
+        assert_eq!(projects_of(&agent), vec![Some("/work/demo".into())]);
     }
 
     #[test]
