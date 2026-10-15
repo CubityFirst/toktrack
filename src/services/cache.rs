@@ -71,8 +71,9 @@ fn normalize_model_keys(models: HashMap<String, ModelUsage>) -> HashMap<String, 
 /// archived sessions, which were previously excluded from discovery. v18
 /// recalculates recorded Codex Fast usage with model-specific multipliers. v19
 /// backfills OpenCode v2 messages while deduplicating migrated v1/v2 turns. v20
-/// backfills OpenCode v2 compaction-request usage.
-const CACHE_VERSION: u32 = 20;
+/// backfills OpenCode v2 compaction-request usage. v21 folds Claude Code
+/// worktree cwds (`<repo>/.claude/worktrees/<name>`) into their repo's project.
+const CACHE_VERSION: u32 = 21;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DailySummaryCache {
