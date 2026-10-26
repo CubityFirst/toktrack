@@ -7,6 +7,7 @@ pub mod config;
 pub mod data_loader;
 pub mod normalizer;
 pub mod pricing;
+pub mod project_roots;
 pub mod remote;
 pub mod update_checker;
 

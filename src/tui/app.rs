@@ -1,6 +1,7 @@
 //! Application state and event loop
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -15,11 +16,15 @@ use super::theme::Theme;
 
 use crate::parsers::ParserRegistry;
 use crate::services::audit::{self, AuditReport};
+use crate::services::config::ConfigService;
+use crate::services::project_roots;
 use crate::services::update_checker::{check_for_update, execute_update, UpdateCheckResult};
 use crate::services::{
     Aggregator, DailySummaryCacheService, DataLoaderService, RemoteOptions, RemoteSourceService,
 };
-use crate::types::{CacheWarning, DailySummary, SourceUsage, StatsData, TotalSummary};
+use crate::types::{
+    CacheWarning, DailySummary, ProjectUsage, SourceUsage, StatsData, TotalSummary, NO_PROJECT,
+};
 
 use super::widgets::{
     daily::{DailyData, DailyView, DailyViewMode, SortDirection, SortKey},
@@ -106,12 +111,38 @@ pub struct AppData {
     pub project_daily_data: HashMap<String, DailyData>,
     /// Per-project stats data, keyed by raw project identifier (drill-down).
     pub project_stats_data: HashMap<String, StatsData>,
+    /// Unfolded per-project usage, kept so the project views can be rebuilt
+    /// when the starred root folders change.
+    pub raw_project_usage: HashMap<String, ProjectUsage>,
+    /// Unfolded per-project daily summaries (see `raw_project_usage`).
+    pub raw_project_summaries: HashMap<String, Vec<DailySummary>>,
+    /// Roots the project views were last built with.
+    pub applied_project_roots: Vec<String>,
     /// Cache warning indicator for display in TUI
     #[allow(dead_code)] // Reserved for warning indicator feature
     pub cache_warning: Option<CacheWarning>,
 }
 
 impl AppData {
+    /// Rebuild the project list and drill-down tables with every project
+    /// under a starred root folded into it. Daily tables come back
+    /// date-ascending; callers re-apply the active sort.
+    fn apply_project_roots(&mut self, roots: &[String]) {
+        let usage = project_roots::collapse_usage(&self.raw_project_usage, roots);
+        self.projects_data = ProjectsData::from_project_usage(&usage, roots);
+
+        let summaries = project_roots::collapse_daily(&self.raw_project_summaries, roots);
+        self.project_daily_data.clear();
+        self.project_stats_data.clear();
+        for (project, days) in summaries {
+            self.project_stats_data
+                .insert(project.clone(), StatsData::from_daily_summaries(&days));
+            self.project_daily_data
+                .insert(project, DailyData::from_daily_summaries(days));
+        }
+        self.applied_project_roots = roots.to_vec();
+    }
+
     /// Apply the sort to every daily table: the aggregate one plus the
     /// per-source and per-project drill-down tables, so the shared sort state
     /// holds no matter which drill-down is opened next.
@@ -157,7 +188,9 @@ impl UpdateStatus {
 }
 
 /// Data loading function — injectable so tests never touch the real filesystem.
-type DataLoader = fn(RemoteOptions) -> Result<Box<AppData>, String>;
+/// Receives the starred project roots so the project views are folded on the
+/// loader thread rather than the UI thread.
+type DataLoader = fn(RemoteOptions, Vec<String>) -> Result<Box<AppData>, String>;
 
 /// Main application
 pub struct App {
@@ -169,6 +202,13 @@ pub struct App {
     total_selected: bool,
     /// Selected row in the Projects tab list.
     project_selected: usize,
+    /// Project folders starred as roots (Projects tab folds subfolders in).
+    project_roots: Vec<String>,
+    /// Config file the roots are persisted to; `None` keeps them in memory
+    /// only (tests).
+    config_path: Option<PathBuf>,
+    /// Why the last root toggle could not be saved, shown on the Projects tab.
+    project_roots_error: Option<String>,
     daily_scroll: usize,
     weekly_scroll: usize,
     monthly_scroll: usize,
@@ -218,6 +258,9 @@ impl App {
             source_selected: 0,
             total_selected: false,
             project_selected: 0,
+            project_roots: Vec::new(),
+            config_path: None,
+            project_roots_error: None,
             daily_scroll: 0,
             weekly_scroll: 0,
             monthly_scroll: 0,
@@ -265,9 +308,10 @@ impl App {
         }
         let loader = self.data_loader;
         let remote_options = self.remote_options.clone();
+        let project_roots = self.project_roots.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(loader(remote_options));
+            let _ = tx.send(loader(remote_options, project_roots));
         });
         self.data_rx = Some(rx);
     }
@@ -544,12 +588,82 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.open_project_detail(),
+                KeyCode::Char('*') => self.toggle_selected_project_root(),
                 _ => {}
             },
             Tab::Stats | Tab::Models | Tab::Audit => {
                 // These tabs have no additional keys beyond the common ones.
             }
         }
+    }
+
+    /// Load the starred project roots from `path` and persist later toggles
+    /// there. An unreadable config leaves the roots empty.
+    fn attach_config(&mut self, path: Option<PathBuf>) {
+        if let Some(Ok(Some(config))) = path.as_deref().map(ConfigService::load_optional) {
+            self.project_roots = config.project_roots;
+        }
+        self.config_path = path;
+        self.refresh_project_roots();
+    }
+
+    /// Rebuild the project views for the current roots, keeping the active sort.
+    fn refresh_project_roots(&mut self) {
+        if let AppState::Ready { data } = &mut self.state {
+            data.apply_project_roots(&self.project_roots);
+            data.apply_sort(self.sort_key, self.sort_direction);
+        }
+    }
+
+    /// Star or unstar the selected project as a root folder and persist it.
+    fn toggle_selected_project_root(&mut self) {
+        let AppState::Ready { data } = &self.state else {
+            return;
+        };
+        let Some(project) = data.projects_data.projects.get(self.project_selected) else {
+            return;
+        };
+        if project.key == NO_PROJECT {
+            return;
+        }
+        let key = project.key.clone();
+
+        match self.save_project_root_toggle(&key) {
+            Ok(roots) => {
+                self.project_roots = roots;
+                self.project_roots_error = None;
+            }
+            Err(message) => {
+                project_roots::toggle(&mut self.project_roots, &key);
+                self.project_roots_error = Some(message);
+            }
+        }
+        self.refresh_project_roots();
+
+        // Keep the cursor on the toggled project, or on the root it folded into.
+        if let AppState::Ready { data } = &self.state {
+            let shown = project_roots::root_for(&key, &self.project_roots).unwrap_or(&key);
+            let projects = &data.projects_data.projects;
+            self.project_selected = projects
+                .iter()
+                .position(|p| p.key == shown)
+                .unwrap_or(self.project_selected.min(projects.len().saturating_sub(1)));
+        }
+    }
+
+    /// Toggle `key` against the roots on disk (so edits made elsewhere are
+    /// kept) and save. Returns the resulting roots. Without a config path the
+    /// toggle applies to the in-memory roots only.
+    fn save_project_root_toggle(&self, key: &str) -> Result<Vec<String>, String> {
+        let Some(path) = &self.config_path else {
+            let mut roots = self.project_roots.clone();
+            project_roots::toggle(&mut roots, key);
+            return Ok(roots);
+        };
+        let mut config = ConfigService::load_or_default(path).map_err(|e| e.to_string())?;
+        config.toggle_project_root(key);
+        ConfigService::save(path, &config).map_err(|e| e.to_string())?;
+        Ok(config.project_roots)
     }
 
     /// Enter the per-project drill-down for the currently selected project.
@@ -761,6 +875,11 @@ impl App {
     fn apply_data_result(&mut self, result: Result<Box<AppData>, String>) {
         match result {
             Ok(mut data) => {
+                // Built on the loader thread; refold only if a root was
+                // toggled while the load was in flight.
+                if data.applied_project_roots != self.project_roots {
+                    data.apply_project_roots(&self.project_roots);
+                }
                 // Fresh loads arrive date-ascending; re-apply the user's sort.
                 data.apply_sort(self.sort_key, self.sort_direction);
                 self.state = AppState::Ready { data };
@@ -996,6 +1115,7 @@ impl Widget for &App {
                                 self.theme,
                             )
                             .with_tab(*tab)
+                            .with_error(self.project_roots_error.as_deref())
                             .render(area, buf);
                         }
                         Tab::Audit => {
@@ -1143,7 +1263,10 @@ fn compute_audit(remote_options: RemoteOptions) -> Result<AuditReport, String> {
 
 /// Load data synchronously (extracted for background thread).
 /// Uses cache-first strategy via DataLoaderService.
-fn load_data_sync(remote_options: RemoteOptions) -> Result<Box<AppData>, String> {
+fn load_data_sync(
+    remote_options: RemoteOptions,
+    project_roots: Vec<String>,
+) -> Result<Box<AppData>, String> {
     let extra_sources =
         RemoteSourceService::sync_and_build_sources(&remote_options).map_err(|e| e.to_string())?;
     let result = DataLoaderService::with_extra_sources(extra_sources)
@@ -1155,6 +1278,7 @@ fn load_data_sync(remote_options: RemoteOptions) -> Result<Box<AppData>, String>
         result.source_usage,
         result.source_summaries,
         result.cache_warning,
+        &project_roots,
     )
 }
 
@@ -1164,6 +1288,7 @@ fn build_app_data_from_summaries(
     source_usage: Vec<SourceUsage>,
     source_summaries: HashMap<String, Vec<DailySummary>>,
     cache_warning: Option<CacheWarning>,
+    project_roots: &[String],
 ) -> Result<Box<AppData>, String> {
     let total = Aggregator::total_from_daily(&summaries);
 
@@ -1185,20 +1310,11 @@ fn build_app_data_from_summaries(
     let models_data = ModelsData::from_model_usage(&model_map);
     let stats_data = StatsData::from_daily_summaries(&summaries);
 
-    // Build per-project data (high-level list + per-project drill-down) before
-    // `summaries` is moved into the daily view below.
-    let project_map = Aggregator::by_project_from_daily(&summaries);
-    let projects_data = ProjectsData::from_project_usage(&project_map);
-    let project_summaries = Aggregator::project_daily_summaries(&summaries);
-    let mut project_daily_data = HashMap::new();
-    let mut project_stats_data = HashMap::new();
-    for (project, summ) in &project_summaries {
-        project_daily_data.insert(
-            project.clone(),
-            DailyData::from_daily_summaries(summ.clone()),
-        );
-        project_stats_data.insert(project.clone(), StatsData::from_daily_summaries(summ));
-    }
+    // Keep the unfolded per-project data before `summaries` is moved into the
+    // daily view below; the project views are built from it by
+    // `apply_project_roots`.
+    let raw_project_usage = Aggregator::by_project_from_daily(&summaries);
+    let raw_project_summaries = Aggregator::project_daily_summaries(&summaries);
 
     let daily_data = DailyData::from_daily_summaries(summaries);
 
@@ -1222,7 +1338,7 @@ fn build_app_data_from_summaries(
         );
     }
 
-    Ok(Box::new(AppData {
+    let mut data = Box::new(AppData {
         total,
         daily_tokens,
         models_data,
@@ -1232,15 +1348,21 @@ fn build_app_data_from_summaries(
         source_daily_data,
         source_models_data,
         source_stats_data,
-        projects_data,
-        project_daily_data,
-        project_stats_data,
+        projects_data: ProjectsData::default(),
+        project_daily_data: HashMap::new(),
+        project_stats_data: HashMap::new(),
+        raw_project_usage,
+        raw_project_summaries,
+        applied_project_roots: Vec::new(),
         cache_warning,
-    }))
+    });
+    data.apply_project_roots(project_roots);
+    Ok(data)
 }
 
 fn run_app(terminal: &mut DefaultTerminal, config: TuiConfig, theme: Theme) -> anyhow::Result<()> {
     let mut app = App::new(config, theme);
+    app.attach_config(ConfigService::default_config_path().ok());
     app.terminal_height = terminal.size()?.height;
 
     app.start_data_load();
@@ -1385,6 +1507,9 @@ mod tests {
                 projects_data: Default::default(),
                 project_daily_data: HashMap::new(),
                 project_stats_data: HashMap::new(),
+                raw_project_usage: HashMap::new(),
+                raw_project_summaries: HashMap::new(),
+                applied_project_roots: Vec::new(),
                 cache_warning: None,
             }),
         };
@@ -1499,8 +1624,8 @@ mod tests {
             ("codex".to_string(), vec![sort_test_summary(1, 100, 0, 2.0)]),
         ]);
         let merged = sort_test_summary(1, 200, 0, 3.0);
-        let data =
-            build_app_data_from_summaries(vec![merged], vec![], source_summaries, None).unwrap();
+        let data = build_app_data_from_summaries(vec![merged], vec![], source_summaries, None, &[])
+            .unwrap();
         let mut app = App {
             state: AppState::Ready { data },
             ..Default::default()
@@ -1960,6 +2085,9 @@ mod tests {
             projects_data: Default::default(),
             project_daily_data: HashMap::new(),
             project_stats_data: HashMap::new(),
+            raw_project_usage: HashMap::new(),
+            raw_project_summaries: HashMap::new(),
+            applied_project_roots: Vec::new(),
             cache_warning: None,
         })));
 
@@ -2417,64 +2545,184 @@ mod tests {
     /// Build a Ready app holding a single project so the Projects drill-down can
     /// be exercised end-to-end.
     fn ready_app_with_one_project(key: &str) -> App {
+        ready_app_with_projects(&[(key, 100, 1.0)])
+    }
+
+    /// Build a Ready app whose single day holds the given `(project, input
+    /// tokens, cost)` rows, through the production `AppData` builder.
+    fn ready_app_with_projects(projects: &[(&str, u64, f64)]) -> App {
         let mut summary = DailySummary {
             date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            total_input_tokens: 100,
-            total_output_tokens: 50,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             total_reasoning_tokens: 0,
             total_cache_creation_5m_tokens: 0,
             total_cache_creation_1h_tokens: 0,
             total_web_search_requests: 0,
-            total_cost_usd: 1.0,
+            total_cost_usd: 0.0,
             models: HashMap::new(),
             projects: HashMap::new(),
         };
-        let mut pu = crate::types::ProjectUsage {
-            input_tokens: 100,
-            output_tokens: 50,
-            cost_usd: 1.0,
-            count: 1,
-            ..Default::default()
-        };
-        pu.models
-            .insert("claude-opus".to_string(), Default::default());
-        summary.projects.insert(key.to_string(), pu.clone());
-
-        let summaries = vec![summary];
-        let projects_data =
-            ProjectsData::from_project_usage(&Aggregator::by_project_from_daily(&summaries));
-        let project_summaries = Aggregator::project_daily_summaries(&summaries);
-        let mut project_daily_data = HashMap::new();
-        let mut project_stats_data = HashMap::new();
-        for (p, s) in &project_summaries {
-            project_daily_data.insert(p.clone(), DailyData::from_daily_summaries(s.clone()));
-            project_stats_data.insert(p.clone(), StatsData::from_daily_summaries(s));
+        for &(key, input, cost) in projects {
+            let mut pu = crate::types::ProjectUsage {
+                input_tokens: input,
+                cost_usd: cost,
+                count: 1,
+                ..Default::default()
+            };
+            pu.models
+                .insert("claude-opus".to_string(), Default::default());
+            summary.projects.insert(key.to_string(), pu);
+            summary.total_input_tokens += input;
+            summary.total_cost_usd += cost;
         }
 
-        let data = AppData {
-            total: crate::types::TotalSummary::default(),
-            daily_tokens: vec![],
-            models_data: ModelsData::from_model_usage(&HashMap::new()),
-            daily_data: DailyData::from_daily_summaries(summaries.clone()),
-            stats_data: StatsData::from_daily_summaries(&summaries),
-            source_usage: vec![],
-            source_daily_data: HashMap::new(),
-            source_models_data: HashMap::new(),
-            source_stats_data: HashMap::new(),
-            projects_data,
-            project_daily_data,
-            project_stats_data,
-            cache_warning: None,
-        };
-
+        let data = build_app_data_from_summaries(vec![summary], vec![], HashMap::new(), None, &[])
+            .unwrap();
         App {
-            state: AppState::Ready {
-                data: Box::new(data),
-            },
+            state: AppState::Ready { data },
             ..App::default()
         }
+    }
+
+    fn project_rows(app: &App) -> Vec<(String, u64, bool)> {
+        match &app.state {
+            AppState::Ready { data } => data
+                .projects_data
+                .projects
+                .iter()
+                .map(|p| (p.key.clone(), p.total_tokens, p.is_root))
+                .collect(),
+            _ => panic!("app not ready"),
+        }
+    }
+
+    fn select_project(app: &mut App, key: &str) {
+        let rows = project_rows(app);
+        app.project_selected = rows.iter().position(|(k, _, _)| k == key).unwrap();
+    }
+
+    #[test]
+    fn test_star_folds_subfolders_into_root_and_unstar_restores() {
+        let mut app = ready_app_with_projects(&[
+            ("/w/repo", 100, 3.0),
+            ("/w/repo/a", 20, 2.0),
+            ("/w/repo/b/c", 5, 1.0),
+            ("/w/other", 1, 0.5),
+        ]);
+        press(&mut app, KeyCode::Char('4'));
+        select_project(&mut app, "/w/repo");
+
+        press(&mut app, KeyCode::Char('*'));
+        assert_eq!(app.project_roots, vec!["/w/repo"]);
+        assert_eq!(
+            project_rows(&app),
+            vec![
+                ("/w/repo".to_string(), 125, true),
+                ("/w/other".to_string(), 1, false),
+            ]
+        );
+        assert_eq!(app.project_selected, 0);
+        // The drill-down shows the folded totals too.
+        match &app.state {
+            AppState::Ready { data } => {
+                assert!(data.project_daily_data.contains_key("/w/repo"));
+                assert!(!data.project_daily_data.contains_key("/w/repo/a"));
+                let stats = data.project_stats_data.get("/w/repo").unwrap();
+                assert!((stats.total_cost - 6.0).abs() < 1e-9);
+            }
+            _ => unreachable!(),
+        }
+
+        press(&mut app, KeyCode::Char('*'));
+        assert!(app.project_roots.is_empty());
+        assert_eq!(project_rows(&app).len(), 4);
+        assert!(project_rows(&app).iter().all(|(_, _, root)| !root));
+    }
+
+    #[test]
+    fn test_unstar_nested_root_keeps_selection_on_outer_root() {
+        let mut app = ready_app_with_projects(&[("/w", 1, 0.1), ("/w/big", 10, 1.0)]);
+        app.project_roots = vec!["/w".to_string(), "/w/big".to_string()];
+        app.refresh_project_roots();
+        press(&mut app, KeyCode::Char('4'));
+        select_project(&mut app, "/w/big");
+
+        press(&mut app, KeyCode::Char('*'));
+        assert_eq!(app.project_roots, vec!["/w"]);
+        assert_eq!(project_rows(&app), vec![("/w".to_string(), 11, true)]);
+        assert_eq!(app.project_selected, 0);
+    }
+
+    #[test]
+    fn test_star_ignores_no_project_row() {
+        let mut app = ready_app_with_projects(&[(crate::types::NO_PROJECT, 10, 1.0)]);
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('*'));
+        assert!(app.project_roots.is_empty());
+    }
+
+    #[test]
+    fn test_star_persists_to_config_and_loads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut app = ready_app_with_projects(&[("/w/repo", 10, 1.0)]);
+        app.attach_config(Some(path.clone()));
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('*'));
+
+        let saved = ConfigService::load_optional(&path).unwrap().unwrap();
+        assert_eq!(saved.project_roots, vec!["/w/repo"]);
+        assert!(app.project_roots_error.is_none());
+
+        let mut fresh = App::default();
+        fresh.attach_config(Some(path));
+        assert_eq!(fresh.project_roots, vec!["/w/repo"]);
+    }
+
+    #[test]
+    fn test_star_keeps_working_when_config_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "not = [valid").unwrap();
+        let mut app = ready_app_with_projects(&[("/w/repo", 10, 1.0)]);
+        app.attach_config(Some(path.clone()));
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('*'));
+
+        assert_eq!(app.project_roots, vec!["/w/repo"]);
+        assert!(app.project_roots_error.is_some());
+        // The broken file is left untouched rather than overwritten.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not = [valid");
+    }
+
+    #[test]
+    fn test_loader_builds_with_current_project_roots() {
+        let data = build_app_data_from_summaries(
+            vec![],
+            vec![],
+            HashMap::new(),
+            None,
+            &["/w/repo".to_string()],
+        )
+        .unwrap();
+        assert_eq!(data.applied_project_roots, vec!["/w/repo"]);
+    }
+
+    #[test]
+    fn test_fresh_data_load_applies_project_roots() {
+        let mut app = App {
+            project_roots: vec!["/w/repo".to_string()],
+            ..App::default()
+        };
+        let fresh = ready_app_with_projects(&[("/w/repo/a", 10, 1.0), ("/w/repo/b", 5, 1.0)]);
+        let AppState::Ready { data } = fresh.state else {
+            unreachable!()
+        };
+        app.apply_data_result(Ok(data));
+        assert_eq!(project_rows(&app), vec![("/w/repo".to_string(), 15, true)]);
     }
 
     #[test]
@@ -2521,7 +2769,7 @@ mod tests {
     }
 
     /// Stub loader for refresh tests — never touches the real filesystem.
-    fn stub_loader(_: RemoteOptions) -> Result<Box<AppData>, String> {
+    fn stub_loader(_: RemoteOptions, _: Vec<String>) -> Result<Box<AppData>, String> {
         Err("stub loader".to_string())
     }
 
@@ -2542,6 +2790,9 @@ mod tests {
             projects_data: Default::default(),
             project_daily_data: HashMap::new(),
             project_stats_data: HashMap::new(),
+            raw_project_usage: HashMap::new(),
+            raw_project_summaries: HashMap::new(),
+            applied_project_roots: Vec::new(),
             cache_warning: None,
         })
     }

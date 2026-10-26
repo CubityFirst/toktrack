@@ -41,6 +41,8 @@ pub struct ProjectSummary {
     pub display: String,
     pub total_tokens: u64,
     pub cost_usd: f64,
+    /// Starred as a root folder (subfolders are folded into it).
+    pub is_root: bool,
 }
 
 /// Data for the projects view.
@@ -53,8 +55,12 @@ pub struct ProjectsData {
 }
 
 impl ProjectsData {
-    /// Build from `Aggregator::by_project_from_daily()` output.
-    pub fn from_project_usage(project_map: &HashMap<String, ProjectUsage>) -> Self {
+    /// Build from `Aggregator::by_project_from_daily()` output (already folded
+    /// onto `roots`); keys listed in `roots` are flagged as root rows.
+    pub fn from_project_usage(
+        project_map: &HashMap<String, ProjectUsage>,
+        roots: &[String],
+    ) -> Self {
         let total_cost: f64 = project_map.values().map(|p| p.cost_usd).sum();
 
         let mut projects: Vec<ProjectSummary> = project_map
@@ -64,6 +70,7 @@ impl ProjectsData {
                 display: project_display_name(key),
                 total_tokens: usage.total_tokens(),
                 cost_usd: usage.cost_usd,
+                is_root: roots.iter().any(|root| root == key),
             })
             .filter(|p| p.total_tokens > 0)
             .collect();
@@ -94,6 +101,8 @@ pub struct ProjectsView<'a> {
     selected: Option<usize>,
     theme: Theme,
     tab: Tab,
+    /// Shown in place of the keybindings (e.g. a failed root-folder save).
+    error: Option<&'a str>,
 }
 
 impl<'a> ProjectsView<'a> {
@@ -103,11 +112,17 @@ impl<'a> ProjectsView<'a> {
             selected,
             theme,
             tab: Tab::Projects,
+            error: None,
         }
     }
 
     pub fn with_tab(mut self, tab: Tab) -> Self {
         self.tab = tab;
+        self
+    }
+
+    pub fn with_error(mut self, error: Option<&'a str>) -> Self {
+        self.error = error;
         self
     }
 }
@@ -220,11 +235,22 @@ impl ProjectsView<'_> {
             };
             let bar = format_percentage_bar(percent, 12);
 
-            let name = if project.display.chars().count() > 32 {
-                format!("{}…", project.display.chars().take(31).collect::<String>())
+            // Root rows reserve two columns of the name cell for " ★".
+            let star = if project.is_root { " ★" } else { "" };
+            let max_name = 32 - star.chars().count();
+            let name = if project.display.chars().count() > max_name {
+                format!(
+                    "{}…",
+                    project
+                        .display
+                        .chars()
+                        .take(max_name - 1)
+                        .collect::<String>()
+                )
             } else {
                 project.display.clone()
             };
+            let padding = 34 - name.chars().count() - star.chars().count();
 
             let marker = if is_selected { "▸ " } else { "  " };
             let name_style = if is_selected {
@@ -237,7 +263,9 @@ impl ProjectsView<'_> {
 
             let row_line = Line::from(vec![
                 Span::styled(marker.to_string(), Style::default().fg(self.theme.accent())),
-                Span::styled(format!("{:<34}", name), name_style),
+                Span::styled(name, name_style),
+                Span::styled(star.to_string(), Style::default().fg(self.theme.date())),
+                Span::raw(" ".repeat(padding)),
                 Span::styled(
                     format!("{:>18}", format_number(project.total_tokens)),
                     Style::default().fg(self.theme.text()),
@@ -265,12 +293,24 @@ impl ProjectsView<'_> {
     }
 
     fn render_keybindings(&self, area: Rect, buf: &mut Buffer) {
+        if let Some(error) = self.error {
+            Paragraph::new(Line::from(Span::styled(
+                format!("Could not save root folders: {}", error),
+                Style::default().fg(self.theme.error()),
+            )))
+            .alignment(Alignment::Center)
+            .render(area, buf);
+            return;
+        }
         let bindings = Paragraph::new(Line::from(vec![
             Span::styled("↑↓", Style::default().fg(self.theme.accent())),
             Span::styled(": Select", Style::default().fg(self.theme.muted())),
             Span::raw("  "),
             Span::styled("Enter", Style::default().fg(self.theme.accent())),
             Span::styled(": Details", Style::default().fg(self.theme.muted())),
+            Span::raw("  "),
+            Span::styled("*", Style::default().fg(self.theme.accent())),
+            Span::styled(": Root", Style::default().fg(self.theme.muted())),
             Span::raw("  "),
             Span::styled("Tab", Style::default().fg(self.theme.accent())),
             Span::styled(": Switch view", Style::default().fg(self.theme.muted())),
@@ -320,7 +360,7 @@ mod tests {
         map.insert("/a/high".to_string(), usage(0.90, 100));
         map.insert("/a/mid".to_string(), usage(0.50, 100));
 
-        let data = ProjectsData::from_project_usage(&map);
+        let data = ProjectsData::from_project_usage(&map, &[]);
         assert_eq!(data.projects.len(), 3);
         assert_eq!(data.projects[0].key, "/a/high");
         assert_eq!(data.projects[1].key, "/a/mid");
@@ -334,7 +374,7 @@ mod tests {
         map.insert("/a/empty".to_string(), usage(0.0, 0));
         map.insert("/a/real".to_string(), usage(0.10, 50));
 
-        let data = ProjectsData::from_project_usage(&map);
+        let data = ProjectsData::from_project_usage(&map, &[]);
         assert_eq!(data.projects.len(), 1);
         assert_eq!(data.projects[0].key, "/a/real");
     }
@@ -343,7 +383,7 @@ mod tests {
     fn test_projects_view_renders_without_panic() {
         let mut map: HashMap<String, ProjectUsage> = HashMap::new();
         map.insert("/srv/work/alpha/beta".to_string(), usage(1.0, 1000));
-        let data = ProjectsData::from_project_usage(&map);
+        let data = ProjectsData::from_project_usage(&map, &[]);
         let view = ProjectsView::new(&data, Some(0), Theme::Dark);
         let area = Rect::new(0, 0, 120, 20);
         let mut buf = Buffer::empty(area);
@@ -357,6 +397,54 @@ mod tests {
         }
         assert!(content.contains("alpha/beta"));
         assert!(content.contains("Project"));
+    }
+
+    #[test]
+    fn test_projects_data_flags_roots() {
+        let mut map: HashMap<String, ProjectUsage> = HashMap::new();
+        map.insert("/w/repo".to_string(), usage(1.0, 100));
+        map.insert("/w/other".to_string(), usage(0.5, 100));
+
+        let data = ProjectsData::from_project_usage(&map, &["/w/repo".to_string()]);
+        assert!(data.projects[0].is_root);
+        assert!(!data.projects[1].is_root);
+    }
+
+    #[test]
+    fn test_projects_view_renders_star_on_root() {
+        let mut map: HashMap<String, ProjectUsage> = HashMap::new();
+        map.insert("/w/repo".to_string(), usage(1.0, 100));
+        map.insert("/w/other".to_string(), usage(0.5, 100));
+        let data = ProjectsData::from_project_usage(&map, &["/w/repo".to_string()]);
+        let view = ProjectsView::new(&data, Some(0), Theme::Dark);
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let repo = rows.iter().find(|r| r.contains("w/repo")).unwrap();
+        let other = rows.iter().find(|r| r.contains("w/other")).unwrap();
+        assert!(repo.contains("★"));
+        assert!(!other.contains("★"));
+        // The star must not shift the numeric columns.
+        let dollar_col = |row: &str| row.chars().position(|c| c == '$');
+        assert_eq!(dollar_col(repo), dollar_col(other));
+    }
+
+    #[test]
+    fn test_projects_view_shows_save_error_in_footer() {
+        let data = ProjectsData::default();
+        let view = ProjectsView::new(&data, None, Theme::Dark).with_error(Some("disk full"));
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        let footer: String = (0..area.width)
+            .map(|x| buf[(x, area.height - 1)].symbol())
+            .collect();
+        assert!(footer.contains("disk full"));
     }
 
     #[test]
