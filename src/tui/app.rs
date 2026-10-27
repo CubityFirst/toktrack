@@ -58,6 +58,11 @@ impl Default for ViewMode {
     }
 }
 
+/// SourceDetail key for every source combined, opened from the Overview total.
+/// It has no per-source entry, so the detail view falls back to the aggregate
+/// `daily_data` / `stats_data`.
+const ALL_SOURCES: &str = "All sources";
+
 /// Configuration for TUI startup
 #[derive(Debug, Clone, Default)]
 pub struct TuiConfig {
@@ -160,6 +165,8 @@ pub struct App {
     should_quit: bool,
     view_mode: ViewMode,
     source_selected: usize,
+    /// True when the Overview total (above the source list) is selected.
+    total_selected: bool,
     /// Selected row in the Projects tab list.
     project_selected: usize,
     daily_scroll: usize,
@@ -209,6 +216,7 @@ impl App {
                 tab: config.initial_tab.unwrap_or_default(),
             },
             source_selected: 0,
+            total_selected: false,
             project_selected: 0,
             daily_scroll: 0,
             weekly_scroll: 0,
@@ -486,8 +494,22 @@ impl App {
 
         match self.current_tab() {
             Tab::Overview => match code {
-                KeyCode::Up | KeyCode::Char('k') if self.source_selected > 0 => {
-                    self.source_selected -= 1;
+                KeyCode::Up | KeyCode::Char('k') => {
+                    // Moving up past the first source selects the total.
+                    if self.source_selected > 0 {
+                        self.source_selected -= 1;
+                    } else {
+                        self.total_selected = true;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') if self.total_selected => {
+                    self.total_selected = false;
+                }
+                KeyCode::Enter if self.total_selected => {
+                    self.view_mode = ViewMode::SourceDetail {
+                        source: ALL_SOURCES.to_string(),
+                    };
+                    self.reset_detail_selection_and_scroll();
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if let AppState::Ready { data } = &self.state {
@@ -946,7 +968,9 @@ impl Widget for &App {
                                 total: &data.total,
                                 daily_tokens: &data.daily_tokens,
                                 source_usage: &data.source_usage,
-                                selected_source: Some(self.source_selected),
+                                selected_source: (!self.total_selected)
+                                    .then_some(self.source_selected),
+                                total_selected: self.total_selected,
                                 selected_tab: *tab,
                             };
                             let overview = Overview::new(overview_data, today, self.theme);
@@ -1463,6 +1487,44 @@ mod tests {
                 source: "claude".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_up_from_top_source_selects_total_and_opens_all_sources() {
+        let source_summaries = HashMap::from([
+            (
+                "claude-code".to_string(),
+                vec![sort_test_summary(1, 100, 0, 1.0)],
+            ),
+            ("codex".to_string(), vec![sort_test_summary(1, 100, 0, 2.0)]),
+        ]);
+        let merged = sort_test_summary(1, 200, 0, 3.0);
+        let data =
+            build_app_data_from_summaries(vec![merged], vec![], source_summaries, None).unwrap();
+        let mut app = App {
+            state: AppState::Ready { data },
+            ..Default::default()
+        };
+
+        press(&mut app, KeyCode::Up);
+        assert!(app.total_selected);
+        press(&mut app, KeyCode::Down);
+        assert!(!app.total_selected);
+        assert_eq!(app.source_selected, 0);
+
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.view_mode,
+            ViewMode::SourceDetail {
+                source: ALL_SOURCES.to_string()
+            }
+        );
+        let AppState::Ready { data } = &app.state else {
+            unreachable!()
+        };
+        let (rows, _) = app.active_daily_data(data).for_mode(DailyViewMode::Daily);
+        assert_eq!(rows[0].total_input_tokens, 200);
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub struct OverviewData<'a> {
     pub daily_tokens: &'a [(NaiveDate, u64)],
     pub source_usage: &'a [SourceUsage],
     pub selected_source: Option<usize>,
+    /// The total is selected (Enter opens every source combined).
+    pub total_selected: bool,
     pub selected_tab: Tab,
 }
 
@@ -223,10 +225,17 @@ impl Overview<'_> {
             + self.data.total.total_cache_creation_tokens
             + self.data.total.total_reasoning_tokens;
         let formatted = format_number(total_tokens);
+        // Selected: same marker as a source row, padded on the right so the
+        // number stays centered.
+        let number = if self.data.total_selected {
+            format!("▸ {formatted}  ")
+        } else {
+            formatted
+        };
 
         let hero = Paragraph::new(vec![
             Line::from(Span::styled(
-                &formatted,
+                number,
                 Style::default()
                     .fg(self.theme.accent())
                     .add_modifier(Modifier::BOLD),
@@ -520,6 +529,7 @@ mod tests {
             daily_tokens: &daily,
             source_usage: &sources,
             selected_source: None,
+            total_selected: false,
             selected_tab: Tab::Overview,
         };
         let area = Rect::new(0, 0, 120, 30);
@@ -559,6 +569,7 @@ mod tests {
             daily_tokens: &daily,
             source_usage: &sources,
             selected_source: None,
+            total_selected: false,
             selected_tab: Tab::Overview,
         };
         let area = Rect::new(0, 0, 120, 30);
@@ -580,6 +591,36 @@ mod tests {
             text.contains("estimated cost"),
             "overview should render the estimated-cost legend"
         );
+    }
+
+    #[test]
+    fn test_selected_total_renders_marker() {
+        let total = TotalSummary::default();
+        let daily: Vec<(NaiveDate, u64)> = vec![];
+        let sources = make_sources(&["claude"]);
+        let data = OverviewData {
+            total: &total,
+            daily_tokens: &daily,
+            source_usage: &sources,
+            selected_source: None,
+            total_selected: true,
+            selected_tab: Tab::Overview,
+        };
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        Overview::new(
+            data,
+            NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+            Theme::Dark,
+        )
+        .render(area, &mut buf);
+
+        let text: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("▸ 0"), "total should carry the marker");
+        assert_eq!(text.matches('▸').count(), 1, "no source row is selected");
     }
 
     fn make_sources(names: &[&str]) -> Vec<SourceUsage> {
@@ -609,6 +650,7 @@ mod tests {
             daily_tokens: &daily,
             source_usage: sources,
             selected_source: selected,
+            total_selected: false,
             selected_tab: Tab::Overview,
         };
         let area = Rect::new(0, 0, width, height);
