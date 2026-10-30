@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
@@ -217,16 +218,28 @@ impl ConfigService {
 
     pub fn save(path: &Path, config: &ToktrackConfig) -> Result<()> {
         config.validate()?;
-        if let Some(parent) = path.parent() {
+        // Replace the real file behind a symlinked config (dotfile managers),
+        // not the link itself.
+        let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(config)
             .map_err(|e| ToktrackError::Config(format!("failed to serialize config: {}", e)))?;
         // Write a sibling temp file and rename it over the target, so a full
         // disk or a crash mid-write cannot leave a truncated config behind.
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, content)?;
-        if let Err(e) = fs::rename(&tmp, path) {
+        let tmp = target.with_extension(format!("toml.{}.tmp", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(content.as_bytes())?;
+            // Keep the existing mode (e.g. 0600) instead of the umask default.
+            if let Ok(meta) = fs::metadata(&target) {
+                file.set_permissions(meta.permissions())?;
+            }
+            file.sync_all()?;
+            fs::rename(&tmp, &target)
+        };
+        if let Err(e) = write() {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
@@ -501,5 +514,43 @@ target = "ubuntu@devbox"
 
         assert_eq!(loaded.default_remotes, vec!["devbox"]);
         assert_eq!(loaded.remote("devbox").unwrap().target, "ubuntu@devbox");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_a_symlinked_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let real = temp_dir.path().join("dotfiles").join("config.toml");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, "").unwrap();
+        let link = temp_dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut config = ToktrackConfig::default();
+        config.toggle_project_root("/w/a");
+
+        ConfigService::save(&link, &config).unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let loaded = ConfigService::load_optional(&real).unwrap().unwrap();
+        assert_eq!(loaded.project_roots, vec!["/w/a"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        ConfigService::save(&path, &ToktrackConfig::default()).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
