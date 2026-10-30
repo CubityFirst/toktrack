@@ -31,7 +31,7 @@ Track usage across **all your AI coding CLIs** — Claude Code, GitHub Copilot C
 - **Data Preservation** — Persistent cache keeps your cost history even after a CLI deletes its own session files
 - **Multi-CLI Support** — Claude Code, GitHub Copilot CLI, Codex CLI, Gemini CLI, Qwen Code, OpenCode, PI Agent, Antigravity, Grok CLI in one place
 - **TUI Dashboard** — 5 tabs (Overview, Stats, Models, Projects, Audit) with daily/weekly/monthly views
-- **Per-Project Breakdown** — the Projects tab shows token & cost usage per project (the session working directory), for CLIs that record one. Drill into any project for its day-by-day, per-model breakdown. Usage from CLIs that don't record a project is grouped under `(no project)`. Project details are cached, so they survive past the CLI's 30-day deletion
+- **Per-Project Breakdown** — the Projects tab shows token & cost usage per project (the session working directory), for CLIs that record one. Drill into any project for its day-by-day, per-model breakdown. Usage from CLIs that don't record a project is grouped under `(no project)`. Press `*` on a project to star it as a root folder: every project under it folds into its row (saved to `~/.toktrack/config.toml` as `project_roots`). Project details are cached, so they survive past the CLI's 30-day deletion
 - **CLI Commands** — `daily`, `weekly`, `monthly`, `stats` with JSON output support
 - **Usage Reports** — Shareable text & SVG receipts via `toktrack report`
 - **Fast on huge histories** — simd-json + rayon parallel parsing (~3 GiB/s); cached runs in ~0.04s
@@ -196,6 +196,7 @@ existing snapshot/cache for that remote.
 | `Enter` | Open model breakdown popup (Daily tab) |
 | `d` / `w` / `m` | Daily / Weekly / Monthly view (Daily tab) |
 | `s` / `S` | Sort by date → cost → tokens / Reverse direction (detail views) |
+| `*` | Star / unstar a root folder (Projects tab) |
 | `r` | Refresh data |
 | `?` | Toggle help |
 | `Ctrl+C` | Quit |
@@ -300,7 +301,7 @@ Custom pricing (including `web_search` / `web_fetch` per-request rates) can be s
 │   └── pi-agent_daily.json
 ├── remotes/
 │   └── devbox/codex/sessions/   # Synced remote Codex JSONL snapshots
-├── config.toml                  # Optional remote source configuration
+├── config.toml                  # Optional remotes + starred project roots
 └── pricing.json                 # LiteLLM pricing (1h TTL)
 ```
 

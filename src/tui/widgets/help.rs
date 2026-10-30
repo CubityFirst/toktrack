@@ -72,14 +72,15 @@ impl Widget for HelpPopup {
             Constraint::Length(1), // [8] d/w/m
             Constraint::Length(1), // [9] s / S
             Constraint::Length(1), // [10] Enter (detail)
-            Constraint::Length(1), // [11] Padding
-            Constraint::Length(1), // [12] General header
-            Constraint::Length(1), // [13] Separator
-            Constraint::Length(1), // [14] r
-            Constraint::Length(1), // [15] Ctrl+C
-            Constraint::Length(1), // [16] ?
-            Constraint::Length(1), // [17] Padding
-            Constraint::Length(1), // [18] Close hint
+            Constraint::Length(1), // [11] * (Projects)
+            Constraint::Length(1), // [12] Padding
+            Constraint::Length(1), // [13] General header
+            Constraint::Length(1), // [14] Separator
+            Constraint::Length(1), // [15] r
+            Constraint::Length(1), // [16] Ctrl+C
+            Constraint::Length(1), // [17] ?
+            Constraint::Length(1), // [18] Padding
+            Constraint::Length(1), // [19] Close hint
             Constraint::Min(0),    // Remaining
         ])
         .split(inner);
@@ -128,6 +129,13 @@ impl Widget for HelpPopup {
             "Model breakdown",
             self.theme,
         );
+        render_keybinding(
+            chunks[11],
+            buf,
+            "* (Projects)",
+            "Star root folder",
+            self.theme,
+        );
 
         let gen_header = Line::from(vec![Span::styled(
             "General",
@@ -137,18 +145,18 @@ impl Widget for HelpPopup {
         )]);
         Paragraph::new(gen_header)
             .alignment(Alignment::Left)
-            .render(chunks[12], buf);
+            .render(chunks[13], buf);
 
         buf.set_string(
-            chunks[13].x,
-            chunks[13].y,
+            chunks[14].x,
+            chunks[14].y,
             &sep,
             Style::default().fg(self.theme.muted()),
         );
 
-        render_keybinding(chunks[14], buf, "r", "Refresh data", self.theme);
-        render_keybinding(chunks[15], buf, "Ctrl+C", "Quit", self.theme);
-        render_keybinding(chunks[16], buf, "?", "Toggle help", self.theme);
+        render_keybinding(chunks[15], buf, "r", "Refresh data", self.theme);
+        render_keybinding(chunks[16], buf, "Ctrl+C", "Quit", self.theme);
+        render_keybinding(chunks[17], buf, "?", "Toggle help", self.theme);
 
         let hint = Line::from(vec![Span::styled(
             "Press ? to close",
@@ -156,7 +164,7 @@ impl Widget for HelpPopup {
         )]);
         Paragraph::new(hint)
             .alignment(Alignment::Center)
-            .render(chunks[18], buf);
+            .render(chunks[19], buf);
     }
 }
 
@@ -197,6 +205,17 @@ mod tests {
 
         let content: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(content.contains("Refresh data"));
+    }
+
+    #[test]
+    fn test_help_popup_lists_root_folder_keybinding() {
+        let area = Rect::new(0, 0, POPUP_WIDTH, POPUP_HEIGHT);
+        let mut buf = Buffer::empty(area);
+        HelpPopup::default().render(area, &mut buf);
+
+        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("Star root folder"));
+        assert!(content.contains("Press ? to close"));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
@@ -20,6 +21,10 @@ pub struct ToktrackConfig {
     /// Configured remote machines.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remotes: Vec<RemoteConfig>,
+    /// Project folders starred as roots in the Projects tab; projects under a
+    /// root are folded into it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_roots: Vec<String>,
 }
 
 /// One configured SSH remote.
@@ -142,6 +147,12 @@ impl ToktrackConfig {
         Ok(self.default_remotes.len() != original_len)
     }
 
+    /// Star `path` as a project root, or unstar it if already starred.
+    /// Returns whether it is a root afterwards.
+    pub fn toggle_project_root(&mut self, path: &str) -> bool {
+        crate::services::project_roots::toggle(&mut self.project_roots, path)
+    }
+
     fn validate(&self) -> Result<()> {
         let mut names = HashSet::new();
 
@@ -207,12 +218,31 @@ impl ConfigService {
 
     pub fn save(path: &Path, config: &ToktrackConfig) -> Result<()> {
         config.validate()?;
-        if let Some(parent) = path.parent() {
+        // Replace the real file behind a symlinked config (dotfile managers),
+        // not the link itself.
+        let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(config)
             .map_err(|e| ToktrackError::Config(format!("failed to serialize config: {}", e)))?;
-        fs::write(path, content)?;
+        // Write a sibling temp file and rename it over the target, so a full
+        // disk or a crash mid-write cannot leave a truncated config behind.
+        let tmp = target.with_extension(format!("toml.{}.tmp", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(content.as_bytes())?;
+            // Keep the existing mode (e.g. 0600) instead of the umask default.
+            if let Ok(meta) = fs::metadata(&target) {
+                file.set_permissions(meta.permissions())?;
+            }
+            file.sync_all()?;
+            fs::rename(&tmp, &target)
+        };
+        if let Err(e) = write() {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 }
@@ -427,6 +457,50 @@ target = "ubuntu@devbox"
     }
 
     #[test]
+    fn config_without_project_roots_still_loads() {
+        let config = load_config(r#"default_remotes = []"#).unwrap();
+        assert!(config.project_roots.is_empty());
+    }
+
+    #[test]
+    fn toggle_project_root_adds_then_removes() {
+        let mut config = ToktrackConfig::default();
+        assert!(config.toggle_project_root("/w/repo"));
+        assert_eq!(config.project_roots, vec!["/w/repo"]);
+        assert!(!config.toggle_project_root("/w/repo"));
+        assert!(config.project_roots.is_empty());
+    }
+
+    #[test]
+    fn project_roots_round_trip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let mut config = ToktrackConfig::default();
+        config.toggle_project_root(r"G:\work\repo");
+
+        ConfigService::save(&path, &config).unwrap();
+        let loaded = ConfigService::load_optional(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.project_roots, vec![r"G:\work\repo"]);
+    }
+
+    #[test]
+    fn save_replaces_existing_config_without_leaving_temp_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let mut config = ToktrackConfig::default();
+        config.toggle_project_root("/w/a");
+        ConfigService::save(&path, &config).unwrap();
+        config.toggle_project_root("/w/b");
+        ConfigService::save(&path, &config).unwrap();
+
+        let loaded = ConfigService::load_optional(&path).unwrap().unwrap();
+        assert_eq!(loaded.project_roots, vec!["/w/a", "/w/b"]);
+        let entries: Vec<_> = fs::read_dir(temp_dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
     fn save_creates_parent_dirs_and_round_trips() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join(".toktrack").join("config.toml");
@@ -440,5 +514,43 @@ target = "ubuntu@devbox"
 
         assert_eq!(loaded.default_remotes, vec!["devbox"]);
         assert_eq!(loaded.remote("devbox").unwrap().target, "ubuntu@devbox");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_a_symlinked_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let real = temp_dir.path().join("dotfiles").join("config.toml");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, "").unwrap();
+        let link = temp_dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut config = ToktrackConfig::default();
+        config.toggle_project_root("/w/a");
+
+        ConfigService::save(&link, &config).unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let loaded = ConfigService::load_optional(&real).unwrap().unwrap();
+        assert_eq!(loaded.project_roots, vec!["/w/a"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        ConfigService::save(&path, &ToktrackConfig::default()).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
